@@ -10,7 +10,8 @@ from tensorflow.keras.regularizers import l2
 
 from PIL import Image
 
-from utils import compose 
+from yolo3.utils import compose 
+from yolo3.utils import box_iou
 
 @wraps(Conv2D)
 def DarkNetConv2D(*args,**kwargs):
@@ -52,7 +53,7 @@ def make_last_layers(x,num_filters,out_filters):
 
     y = compose(
         DarkNetConv2D_BN_Leaky(num_filters * 2,(3,3)),
-        DarkNetConv2D_BN_Leaky(out_filters,(1,1))
+        DarkNetConv2D(out_filters,(1,1))
     )(x)
 
     return x,y
@@ -170,6 +171,7 @@ def yolo_head(features,anchors,num_classes,input_shape,calc_loss=False):
     num_anchors = len(anchors)
     # reshape to batch,height,width,num_anchors,box_params
     anchors_tensor = tf.reshape(tf.constant(anchors),[1,1,1,num_anchors,2])
+    anchors_tensor = tf.cast(anchors_tensor,tf.float32)
 
     grid_shape = features.shape[1:3] # grid cell => width x height
     grid_y = tf.tile(tf.reshape(tf.range(0,grid_shape[0]),[-1,1,1,1]),[1,grid_shape[1],1,1])
@@ -192,111 +194,6 @@ def yolo_head(features,anchors,num_classes,input_shape,calc_loss=False):
 
     return box_xy,box_wh,box_confidence,box_class_probs
 
-def yolo_correct_boxes(box_xy,box_wh,input_shape,image_shape):
-
-    box_yx = box_xy[...,::-1]
-    box_hw = box_wh[...,::-1]
-    input_shape = tf.cast(input_shape,tf.float32)
-    image_shape = tf.cast(image_shape,tf.float32)
-    new_shape = tf.round(image_shape * tf.reduce_min(input_shape / image_shape))
-    offset = (input_shape - new_shape) / 2. / input_shape
-    scale = input_shape / new_shape
-    box_yx = (box_yx - offset) * scale
-    box_hw *= scale
-
-    box_mins = box_yx - (box_hw / 2.0)
-    box_maxes = box_yx - (box_hw / 2.0)
-
-    boxes = tf.concat([
-        box_mins[...,0:1],
-        box_mins[...,1:2],
-        box_maxes[...,0:1],
-        box_maxes[...,1:2]
-    ])
-
-    boxes *= tf.concat([image_shape,image_shape])
-    retur boxes
-
-def yolo_boxes_and_scores(features,anchors,num_classes,input_shape,image_shape):
-    box_xy,box_wh,box_confidence,box_class_probs = yolo_head(features,anchors,num_classes,input_shape)
-
-    boxes = yolo_correct_boxes(box_xy,box_wh,input_shape,image_shape)
-    boxes = tf.reshape(boxes,[-1,4])
-    box_scores = box_confidence * box_class_probs
-    box_scores = tf.reshape(box_scores,[-1,num_classes])
-    return boxes,box_scores
-
-def yolo_eval(yolo_outputs,anchors,num_classes,image_shape,max_boxes=20,score_threshold=0.6,iou_threshold=0.5):
-    num_layers = len(yolo_outputs)
-
-    anchor_mask = [[6,7,8], [3,4,5], [0,1,2]] if num_layers==3 else [[3,4,5], [1,2,3]] # default setting
-    input_shape = yolo_outputs[0].shape[1:3] * 32
-
-    boxes = []
-    box_scores = []
-
-    for l in range(num_layers):
-        _boxes,_box_scores = yolo_boxes_and_scores(yolo_outputs[l],anchores[anchor_mask[l]],num_classes,input_shape,image_shape)
-        boxes.append(_boxes)
-        box_scores.append(_box_scores)
-
-    boxes = tf.concat(boxes,axis=0)
-    box_scores = tf.concat(box_scores,axis=0)
-
-    mask = box_scores >= score_threshold
-    max_boxes_tensor = tf.constant(max_boxes,dtype=tf.int32)
-    boxes_ = []
-    scores_ = []
-    classes_ = []
-
-    for c in range(num_classes):
-        class_boxes = tf.boolean_mask(boxes,mask[:,c])
-        class_box_scores = tf.boolean_mask(box_scores[:,c],mask[:,c])
-        
-        nms_index = tf.image.non_max_suppression(
-            class_boxes,class_box_scores,max_boxes_tensor,iou_threshold=iou_threshold
-        )
-        class_boxes = tf.gather(class_boxes,nms_index)
-        class_box_scores = tf.gather(class_box_scores,nms_index)
-        classes = tf.ones_like(class_box_scores,tf.int32) * c
-        boxes_.append(class_boxes)
-        scores_.append(class_box_scores)
-        classes_.append(classes)
-
-    boxes_ = tf.concat(boxes_,axis=0)
-    scores_ = tf.concat(scores_,axis=0)
-    classes_ = tf.concat(classes_,axis=0)
-
-    return boxes_,scores_,classes_
-
-def box_iou(b1,b2):
-    
-    b1 = tf.expand_dims(b1,-2)
-    b1_xy = b1[...,:2]
-    b1_wh = b1[...,2:4]
-    b1_wh_half = b1_wh / 2.0
-    b1_mins = b1_xy - b1_wh_half
-    b1_maxes = b1_xy + b1_wh_half
-
-    b2 = tf.exp(b2,0)
-    b2_xy = [...,:2]
-    b2_wh = [...,2:4]
-    b2_wh_half = b2_wh / 2.0
-    b2_mins = b2_xy - b2_wh_half
-    b2_maxes = b2_xy + b2_wh_half
-
-    intersect_mins = tf.maximum(b1_mins,b2_mins)
-    intersect_maxes = tf.minimum(b1_maxes,b2_maxes)
-    intersect_wh = tf.maximum(intersect_maxes - intersect_mins,0.)
-    intersect_areas = intersect_wh[...,0] * intersect_wh[...,1]
-
-    b1_area = b1_wh[...,0] * b1_wh[...,1]
-    b2_area = b2_wh[...,0] * b2_wh[...,1]
-
-    iou = intersect_areas / (b1_area + b2_area - intersect_areas)
-
-    return iou
-
 def yolo_loss(args,anchors,num_classes,ignore_thresh = 0.5,print_loss = False):
     
     num_layers = len(anchors) // 3 
@@ -304,7 +201,7 @@ def yolo_loss(args,anchors,num_classes,ignore_thresh = 0.5,print_loss = False):
     y_true = args[num_layers:]
     anchor_mask = [[6,7,8],[3,4,5],[0,1,2]] if num_layers == 3 else [[3,4,5],[0,1,2]]
     input_shape = tf.cast(yolo_outputs[0].shape[1:3] * 32,y_true[0].dtype)
-    grid_shapes = [tf.cast(yolo_outputs[l])[1:3],dtype=y_true[0].dtype) for l in range(num_layers)]
+    grid_shapes = [tf.cast(yolo_outputs[l].shape[1:3],dtype=y_true[0].dtype) for l in range(num_layers)]
     loss = 0
     m = yolo_outputs[0].shape[0]
     mf = tf.cast(m,tf.float32)
@@ -352,119 +249,6 @@ def yolo_loss(args,anchors,num_classes,ignore_thresh = 0.5,print_loss = False):
             loss = tf.Print(loss, [loss, xy_loss, wh_loss, confidence_loss, class_loss, K.sum(ignore_mask)], message='loss: ')
 
     return loss
-
-def preprocess_true_boxes(true_boxes,input_shape,anchors,num_classes):
-    """
-    Preprocess true boxes tor training input format
-    
-    Parameters:
-        true_boxes: shape=(b,T,5) . b,batch size; T, maximum boxes in a traing image;
-        input_shape: (h,w) multiples of 32
-        anchors : array,shape=(N,2),(w,w)
-        num_classes : count of classes
-    """
-    
-    num_layers = len(anchors) // 3 # yolo 网络层输出层的个数，默认为3. 13x13,26x26,52x52
-    anchor_mask = [[6,7,8], [3,4,5], [0,1,2]] if num_layers==3 else [[3,4,5], [1,2,3]] # tiny-yolo 的网络层输出只有2个
-    
-    true_boxes = np.array(true_boxes,dtype=np.float32)
-    input_shape = np.array(input_shape,dtype=np.int32)
-
-    boxes_xy = (true_boxes[...,0:2] + true_boxes[...,2:4]) // 2 # bbox的中心点坐标
-    boxes_wh = (true_boxes[...,2:4] - true_boxes[...,0:2]) # bbox的宽和高
-
-    # 将bbox(x,y,w,h)对416x416做归一化
-    true_boxes[...,0:2] = true_boxes[...,0:2] / input_shape[::-1]
-    true_boxes[...,2:4] = true_boxes[...,2:4] / input_shape[::-1]
-
-    m = true_boxes.shape[0] # batch size
-    grid_shapes = [input_shape // {0:32,1:16,2:8}[l] for l in range(num_layers)] # 输出特征图的尺寸,相对于输入尺寸下采样32，16，8
-
-    '''
-    处理后的用于训练的数据
-    y_true是个长度为3的列表，对应输出的3个尺度。其shape如下：
-    (m,13,13,3,5+num_classes),(m,26,26,3,5+num_classes),(m,52,52,5 + num_classes)
-    m : batch size
-    13 , 26,52 : 网络层输出的feature map的大小， 也就是grid cell的大小
-    3 : 每个 grid cell 预测3个anchor box
-    5 : bbox相对于anchor box的偏移量及其置信度(x,y,w,h,confidence)，真实值confidenct = 1
-    num_classes: bbox所属的类别
-    '''
-    y_true = [np.zeros((m,grid_shapes[1][0],grid_shapes[1][1],len(anchor_mask[l]),5 + num_classes),dtype=np.float32) for l in range(num_layers)]
-    
-    anchors = np.expand_dims(anchors,0) # 扩展第一个维度(1,9,2)
-    anchors_maxes = anchors / 2. 
-    anchors_mins = -anchors_maxes
-    valid_mask = boxes_wh[...,0] > 0 # 判断是否有异常标注的boxes
-
-    for b in range(m): # 每个batch size，也就是每张图片
-        wh = boxes_wh[b,valid_mask[b]]
-        if len(wh) == 0: continue
-
-        wh = np.expand_dims(wh,-2) # 维度扩展(3,2) -> (3,1,2)
-        box_maxes = wh / 2. 
-        box_mins = -box_maxes
-
-        # 当前的true box和哪个 anchor box的iou最大
-        intersect_mins = np.maximum(box_mins,anchors_mins)
-        intersect_maxes = np.minimum(box_maxes,anchors_maxes)
-        intersect_wh = np.maximum(intersect_maxes - intersect_mins,0)
-        intersect_area = intersect_wh[...,0] * intersect_wh[...,1]
-        box_area = wh[...,0] * wh[...,1]
-        anchor_area = anchors[...,0] * anchors[...,1]
-        iou = intersect_area / (box_area + anchor_area - intersect_area)
-
-        best_anchor = np.argmax(iou,axis=-1)
-        # t,第几个true box; n, 和当前true box的iou最大的anchor box
-        for t,n in enumerate(best_anchor): 
-            for l in range(num_layers): # 第l个输出
-                if n in anchor_mask[l] : # 不同的输出层有不同的anchor box，当前true box最匹配的anchor
-                    '''
-                    i,j: true box 映射到最后特征图上的某一个grid cell上，i为列，j为行
-                    '''
-                    i = np.floor(true_boxes[b,t,0] * grid_shapes[l][1]).astype("int32")
-                    j = np.floor(true_boxes[b,t,1] * grid_shapes[l][0]).astype("int32")
-                    # 每个grid cell有3个anchor box，k指和当前true box最匹配的索引[0,1,2]
-                    k = anchor_mask[l].index(n)
-                    c = true_boxes[b,t,4].astype["int32"] # 类别
-                    y_true[l][b,j,i,k,0:4] = true_boxes[b,t,0:4]
-                    y_true[l][b,j,i,k,4] = 1 # 置信度为1
-                    y_true[l][b,j,i,k,5 + c] = 1
-
-    return y_true
-
-def get_random_data(annotation_line,input_shape,max_boxes=20):
-    line = annotation_line.split()
-    image = Image.open(line[0])
-    iw,ih = image.size
-    h,w = input_shape
-
-    # true box
-    box = np.array([np.array(list(map(int,box.split(",")))) for box in line[1:]])
-
-    scale = min(np.float(w) / iw,np.float(h) / ih) # 等比缩放
-
-    nw = int(iw * scale)
-    nh = int(ih * scale)
-    dx = (w - nw ) // 2
-    dy = (h - nh) // 2
-    image_data = 0
-
-    image = image.resize((nw,nh),Image.BICUBIC)
-    new_image = Image.new("RGB",(w,h),(128,128,128)) # 生成416 x 416的RGB图像
-    new_image.paste(image,(dx,dy)) # 将resize后的图像放到416x416的图像中间
-    image_data = np.array(new_image) / 255.0
-
-    # correct boxes
-    box_data = np.zeros(((max_boxes,5)))
-    if len(box) > 0:
-        np.random.shuffle(box)
-        if len(box) > max_boxes: box = box[:max_boxes] # 随机选择max_boxes box
-        box[:,[0,2]] = box[:,[0,2]] * scale + dx # dx 为x轴的增量
-        box[:,[1,3]] = box[:,[1,3]] * scale + dy # dy 为y轴的增量
-        box_data[:len(box)] = box
-
-    return image_data,box_data
 
 
 if __name__ == "__main__":

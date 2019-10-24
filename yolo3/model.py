@@ -138,7 +138,7 @@ def tiny_yolo_body(inputs,num_anchors,num_classes):
     return Model(inputs,[y1,y2])
 
 def mobile_yolo_body(inputs,num_anchors,num_classes):
-    mobile_net = MobileNet(input_tensor=inputs,weights="imagenet")
+    mobile_net = MobileNet(input_tensor=inputs,weights=None)
 
     # conv_pw_13_relu: 13 x 13 x 1024
     # conv_pw_11_relu: 26 x 26 x 512
